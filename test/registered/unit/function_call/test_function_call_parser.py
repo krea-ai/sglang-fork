@@ -1,7 +1,9 @@
 import functools
 import json
+import re
 import unittest
 import warnings
+from unittest import mock
 
 import xgrammar as xgr
 
@@ -6022,6 +6024,197 @@ class TestToolCallParserNames(unittest.TestCase):
             sorted(TOOL_CALL_PARSER_NAMES),
             sorted(FunctionCallParser.ToolCallParserEnum),
         )
+
+
+class TestDeepSeekV32BoundedScan(unittest.TestCase):
+    """parse_streaming_increment finds invoke terminators via a bounded
+    offset scan; these cover the cases where a naive gate would diverge."""
+
+    D = "｜DSML｜"
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="write_file",
+                    description="Write a file",
+                    parameters={
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="lookup",
+                    description="Look up a date",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            ),
+        ]
+
+    def _call_text(self, name="write_file", param="content", body=""):
+        return (
+            f"<{self.D}function_calls>\n"
+            f'<{self.D}invoke name="{name}">\n'
+            f'<{self.D}parameter name="{param}" string="true">{body}</{self.D}parameter>\n'
+            f"</{self.D}invoke>\n</{self.D}function_calls>"
+        )
+
+    def _stream(self, text, chunks=None):
+        detector = DeepSeekV32Detector()
+        calls, normal = [], ""
+        for c in chunks if chunks is not None else list(text):
+            result = detector.parse_streaming_increment(c, self.tools)
+            normal += result.normal_text
+            calls.extend(result.calls)
+        fin = detector.finish(self.tools)
+        normal += fin.normal_text
+        calls.extend(fin.calls)
+        return normal, calls
+
+    def test_self_closing_invoke_streamed(self):
+        text = (
+            f"<{self.D}function_calls>\n"
+            f'<{self.D}invoke name="lookup"/>\n'
+            f"</{self.D}function_calls>"
+        )
+        normal, calls = self._stream(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "lookup")
+        self.assertEqual(json.loads(calls[0].parameters), {})
+        self.assertNotIn("invoke", normal)
+
+    def test_html_argument_body_exact(self):
+        body = (
+            '<div class="box">\n  <img src="a.png"/>\n'
+            "</div>\n<p>x > y</p>\n<input disabled/>"
+        )
+        normal, calls = self._stream(self._call_text(body=body))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "write_file")
+        self.assertEqual(json.loads(calls[0].parameters), {"content": body})
+        self.assertNotIn("div", normal)
+
+    def test_closer_split_at_every_offset(self):
+        text = self._call_text(body="hello world")
+        closer = f"</{self.D}invoke>"
+        start = text.index(closer)
+        for i in range(1, len(closer)):
+            with self.subTest(offset=i):
+                _, calls = self._stream(
+                    text, chunks=[text[: start + i], text[start + i :]]
+                )
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0].name, "write_file")
+                self.assertEqual(
+                    json.loads(calls[0].parameters), {"content": "hello world"}
+                )
+
+    def test_two_consecutive_invokes(self):
+        first = (
+            f'<{self.D}invoke name="write_file">\n'
+            f'<{self.D}parameter name="content" string="true">one</{self.D}parameter>\n'
+            f"</{self.D}invoke>\n"
+        )
+        second = f'<{self.D}invoke name="lookup"/>\n'
+        text = (
+            f"<{self.D}function_calls>\n"
+            + first
+            + second
+            + f"</{self.D}function_calls>"
+        )
+        normal, calls = self._stream(text)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].name, "write_file")
+        self.assertEqual(json.loads(calls[0].parameters), {"content": "one"})
+        self.assertEqual(calls[1].name, "lookup")
+        self.assertEqual(calls[1].tool_index, 1)
+
+    def test_prose_around_call(self):
+        text = "let me write that.\n\n" + self._call_text(body="data")
+        normal, calls = self._stream(text)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("let me write that.", normal)
+        self.assertEqual(json.loads(calls[0].parameters), {"content": "data"})
+
+    def test_stray_angle_brackets_stream_as_prose(self):
+        text = "if a < b and c </ d then done"
+        detector = DeepSeekV32Detector()
+        deltas = ""
+        emitted_early = False
+        for c in text:
+            r = detector.parse_streaming_increment(c, self.tools)
+            if r.normal_text:
+                emitted_early = True
+            deltas += r.normal_text
+        deltas += detector.finish(self.tools).normal_text
+        self.assertTrue(emitted_early)
+        self.assertEqual(deltas, text)
+
+    def test_stray_angle_brackets_before_call(self):
+        text = "if a < b and c </ d then done\n\n" + self._call_text(body="x")
+        normal, calls = self._stream(text)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("if a < b and c </ d then done", normal)
+        self.assertEqual(json.loads(calls[0].parameters), {"content": "x"})
+
+    def test_self_closing_invoke_after_malformed_header(self):
+        for bad in (f"<{self.D}invoke>", f'<{self.D}invoke name="x"y" />'):
+            with self.subTest(bad=bad):
+                text = bad + f'<{self.D}invoke name="lookup"/>'
+                _, calls = self._stream(text)
+                self.assertEqual([c.name for c in calls], ["lookup"])
+
+    def test_self_closing_invoke_after_consumed_call_and_malformed_header(self):
+        text = (
+            self._call_text(body="one").removesuffix(f"</{self.D}function_calls>")
+            + f"<{self.D}invoke>\n"
+            + f'<{self.D}invoke name="lookup"/>\n'
+            + f"</{self.D}function_calls>"
+        )
+        _, calls = self._stream(text)
+        self.assertEqual([c.name for c in calls], ["write_file", "lookup"])
+
+    def _count_invoke_scans(self, text, chunk_size=4):
+        detector = DeepSeekV32Detector()
+        real_search = re.search
+        scans = 0
+
+        def counting_search(pattern, string, flags=0):
+            nonlocal scans
+            if pattern == detector.invoke_regex:
+                scans += 1
+            return real_search(pattern, string, flags)
+
+        calls = []
+        with mock.patch.object(re, "search", side_effect=counting_search):
+            for i in range(0, len(text), chunk_size):
+                result = detector.parse_streaming_increment(
+                    text[i : i + chunk_size], self.tools
+                )
+                calls.extend(result.calls)
+        return scans, calls
+
+    def test_invoke_regex_runs_once_per_completed_invoke(self):
+        body = '<div class="box"><img src="a.png"/></div>\n' * 1000
+        prefixes = {
+            "none": "",
+            "stray closer": f"</{self.D}invoke>",
+            "closed malformed invoke": f"<{self.D}invoke>junk</{self.D}invoke>",
+        }
+        for label, prefix in prefixes.items():
+            with self.subTest(prefix=label):
+                scans, calls = self._count_invoke_scans(
+                    prefix + self._call_text(body=body)
+                )
+                self.assertEqual([c.name for c in calls], ["write_file"])
+                self.assertLessEqual(scans, 2)
 
 
 if __name__ == "__main__":

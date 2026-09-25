@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from dataclasses import dataclass
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -16,6 +17,23 @@ logger = logging.getLogger(__name__)
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"Invalid JSON constant: {value}")
+
+
+@dataclass
+class _ScanState:
+    """Incremental scan progress over the detector buffer. Replaced whenever
+    the buffer is shortened, since its offsets index into the old buffer."""
+
+    # Buffer length at the last scan; closer searches resume from here.
+    scan_pos: int = 0
+    # A DSML marker is known to be in the buffer.
+    seen_dsml: bool = False
+    # Next invoke start to classify, or the end of the first valid header.
+    invoke_hdr_pos: int = 0
+    # The first valid invoke header has been found.
+    invoke_hdr_done: bool = False
+    # That header is self-closing.
+    invoke_self_close: bool = False
 
 
 class DeepSeekV32Detector(BaseFormatDetector):
@@ -99,6 +117,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             rf"|>(?P<body>.*?)(?P<end>(?:</{invoke}>|$)))"
         )
         self.current_tool_id = -1
+        self._scan = _ScanState()
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -249,6 +268,90 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # Fail closed: keep the prose, never surface DSML as content.
             return StreamingParseResult(normal_text=normal_text, calls=calls)
 
+    @staticmethod
+    def _invoke_header_kind(buf: str, i: int) -> tuple[str, int] | None:
+        """Classify the invoke header following the start token at ``buf[i]``
+        against invoke_regex's ``\\s+name="[^"]+"\\s*(/>|>)``. Returns
+        ("self_close" | "open" | "invalid", end offset), or None while the
+        header is still streaming in."""
+        n = len(buf)
+        j = i
+        while j < n and buf[j].isspace():
+            j += 1
+        if j == n:
+            return None
+        if j == i:
+            return "invalid", j
+        for ch in 'name="':
+            if j == n:
+                return None
+            if buf[j] != ch:
+                return "invalid", j
+            j += 1
+        name_start = j
+        j = buf.find('"', j)
+        if j == -1:
+            return None
+        if j == name_start:
+            return "invalid", j
+        j += 1
+        while j < n and buf[j].isspace():
+            j += 1
+        if j == n:
+            return None
+        if buf[j] == ">":
+            return "open", j + 1
+        if buf[j] != "/":
+            return "invalid", j
+        if j + 1 == n:
+            return None
+        if buf[j + 1] == ">":
+            return "self_close", j + 2
+        return "invalid", j
+
+    def _invoke_terminated(self) -> bool:
+        """Whether invoke_regex would now match a complete invoke: the first
+        valid header is self-closing, or an ``</invoke>`` closer follows it."""
+        buf = self._buffer
+        if not self._scan.invoke_hdr_done:
+            # invoke_regex matches the first *valid* header, skipping malformed
+            # ones, so classify each invoke start in turn. Decided-invalid
+            # starts are never revisited, keeping the scan bounded.
+            token = self.invoke_start_token
+            pos = self._scan.invoke_hdr_pos
+            while True:
+                start = buf.find(token, pos)
+                if start == -1:
+                    self._scan.invoke_hdr_pos = max(pos, len(buf) - len(token) + 1)
+                    return False
+                header = self._invoke_header_kind(buf, start + len(token))
+                if header is None:
+                    self._scan.invoke_hdr_pos = start
+                    return False
+                kind, end = header
+                if kind == "invalid":
+                    pos = start + 1
+                    continue
+                self._scan.invoke_hdr_done = True
+                self._scan.invoke_self_close = kind == "self_close"
+                # Closers before the header's end cannot close this invoke.
+                self._scan.invoke_hdr_pos = end
+                break
+        if self._scan.invoke_self_close:
+            return True
+        # Search only past scan_pos, rewound by len(token)-1 so a closer
+        # split across chunks is not missed.
+        return (
+            buf.find(
+                self.invoke_end_token,
+                max(
+                    self._scan.scan_pos - (len(self.invoke_end_token) - 1),
+                    self._scan.invoke_hdr_pos,
+                ),
+            )
+            != -1
+        )
+
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
     ) -> StreamingParseResult:
@@ -259,29 +362,36 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if buffer contains any DSML markers or ends with potential tag prefix
-        # This handles partial/streaming DSML content
-        bar = self.dsml_token[0]
-        dsml_markers = [self.dsml_token, f"<{bar}", f"</{bar}"]
-        potentially_dsml = any(marker in current_text for marker in dsml_markers)
+        # The buffer only grows while a DSML marker is present, so once seen
+        # the full-buffer scans below stay skipped for the rest of the call.
+        if self._scan.seen_dsml:
+            entered_dsml = True
+        else:
+            # Check if buffer contains any DSML markers or ends with potential tag prefix
+            # This handles partial/streaming DSML content
+            bar = self.dsml_token[0]
+            dsml_markers = [self.dsml_token, f"<{bar}", f"</{bar}"]
+            potentially_dsml = any(marker in current_text for marker in dsml_markers)
 
-        # Also check if text ends with start of a tag (to handle "<" arriving separately)
-        dsml_prefixes = ["<", f"<{bar}", "</", f"</{bar}"]
-        ends_with_prefix = any(
-            current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
-        )
+            # Also check if text ends with start of a tag (to handle "<" arriving separately)
+            dsml_prefixes = ["<", f"<{bar}", "</", f"</{bar}"]
+            ends_with_prefix = any(
+                current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
+            )
 
-        if (
-            not self.has_tool_call(current_text)
-            and not potentially_dsml
-            and not ends_with_prefix
-        ):
+            self._scan.seen_dsml = self.has_tool_call(current_text) or potentially_dsml
+            # ends_with_prefix is positional -- a stray "<" holds this chunk
+            # but must not latch seen_dsml, or later prose never releases.
+            entered_dsml = self._scan.seen_dsml or ends_with_prefix
+
+        if not entered_dsml:
             # Trailing whitespace may be the blank line ahead of a DSML block;
             # hold it so it is trimmed with the preamble or dropped with the block.
             stripped = current_text.rstrip()
             if not stripped:
                 return StreamingParseResult()
             self._buffer = current_text[len(stripped) :]
+            self._scan = _ScanState()
             current_text = stripped
             for e_token in [self.eot_token, self.invoke_end_token]:
                 if e_token in current_text:
@@ -293,6 +403,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # buffer that still holds a marker, so later prose stays buffered.
         preamble = ""
         try:
+            # invoke_regex always matches an unclosed invoke (its end group
+            # allows '$'), so entering the loop before a terminator has
+            # streamed in rescans the whole buffer each chunk for nothing.
+            if not self._invoke_terminated():
+                self._scan.scan_pos = len(self._buffer)
+                return StreamingParseResult()
+
             # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Try to match an invoke block (may be partial)
@@ -330,6 +447,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Fail closed: drop this invoke, keep going for the next one.
                     logger.warning(f"Dropping malformed DeepSeek invoke: {e}")
                     self._buffer = current_text[invoke_match.end() :]
+                    self._scan = _ScanState()
                     current_text = self._buffer
                     continue
 
@@ -356,6 +474,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
                 # Remove the completed tool call from buffer and check for another.
                 self._buffer = current_text[invoke_match.end() :]
+                self._scan = _ScanState()
                 current_text = self._buffer
                 self.current_tool_id += 1
 
@@ -367,6 +486,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # Fail closed: drop the buffer, keep any prose ahead of the DSML,
             # and never surface DSML as content.
             self._buffer = ""
+            self._scan = _ScanState()
             if self.current_tool_id == -1:
                 preamble = self._text_before_dsml(current_text)
             return StreamingParseResult(normal_text=preamble, calls=all_calls)
@@ -377,6 +497,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         buffered = self._buffer
         self._buffer = ""
+        self._scan = _ScanState()
         if self.current_tool_id != -1:
             return StreamingParseResult()
 
