@@ -458,6 +458,13 @@ class TestDeepSeekV41BoundedScan(CustomTestCase):
         self.assertIn("if a < b and c </ d then done", normal)
         self.assertEqual(json.loads(calls[0].parameters), {"content": "x"})
 
+    def test_self_closing_invoke_after_malformed_header(self):
+        for bad in (f"<{DSML} invoke>", f'<{DSML} invoke name="x"y" />'):
+            with self.subTest(bad=bad):
+                text = bad + f'<{DSML} invoke name="lookup"/>'
+                _, calls = self._stream(text)
+                self.assertEqual([c.name for c in calls], ["lookup"])
+
 
 if __name__ == "__main__":
     import unittest

@@ -6162,6 +6162,23 @@ class TestDeepSeekV32BoundedScan(unittest.TestCase):
         self.assertIn("if a < b and c </ d then done", normal)
         self.assertEqual(json.loads(calls[0].parameters), {"content": "x"})
 
+    def test_self_closing_invoke_after_malformed_header(self):
+        for bad in (f"<{self.D}invoke>", f'<{self.D}invoke name="x"y" />'):
+            with self.subTest(bad=bad):
+                text = bad + f'<{self.D}invoke name="lookup"/>'
+                _, calls = self._stream(text)
+                self.assertEqual([c.name for c in calls], ["lookup"])
+
+    def test_self_closing_invoke_after_consumed_call_and_malformed_header(self):
+        text = (
+            self._call_text(body="one").removesuffix(f"</{self.D}function_calls>")
+            + f"<{self.D}invoke>\n"
+            + f'<{self.D}invoke name="lookup"/>\n'
+            + f"</{self.D}function_calls>"
+        )
+        _, calls = self._stream(text)
+        self.assertEqual([c.name for c in calls], ["write_file", "lookup"])
+
 
 if __name__ == "__main__":
     unittest.main()
