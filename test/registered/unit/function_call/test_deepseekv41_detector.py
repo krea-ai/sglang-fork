@@ -331,6 +331,134 @@ class TestDeepSeekV41ParameterGrammar(CustomTestCase):
         )
 
 
+class TestDeepSeekV41BoundedScan(CustomTestCase):
+    """Bounded-scan gate cases against V41's real leading-space tag names."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="write_file",
+                    description="Write a file",
+                    parameters={
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="lookup",
+                    description="Look up a date",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            ),
+        ]
+
+    def _call_text(self, name="write_file", param="content", body=""):
+        return (
+            f"\n\n<{DSML} calls>\n"
+            f'<{DSML} invoke name="{name}">\n'
+            f'<{DSML} parameter name="{param}" string="true">{body}</{DSML} parameter>\n'
+            f"</{DSML} invoke>\n</{DSML} calls>"
+        )
+
+    def _stream(self, text, chunks=None):
+        detector = DeepSeekV41Detector()
+        calls, normal = [], ""
+        for c in chunks if chunks is not None else list(text):
+            result = detector.parse_streaming_increment(c, self.tools)
+            normal += result.normal_text
+            calls.extend(result.calls)
+        fin = detector.finish(self.tools)
+        normal += fin.normal_text
+        calls.extend(fin.calls)
+        return normal, calls
+
+    def test_self_closing_invoke_streamed(self):
+        text = f'\n\n<{DSML} calls>\n<{DSML} invoke name="lookup"/>\n</{DSML} calls>'
+        normal, calls = self._stream(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "lookup")
+        self.assertEqual(json.loads(calls[0].parameters), {})
+        self.assertNotIn("invoke", normal)
+
+    def test_html_argument_body_exact(self):
+        body = (
+            '<div class="box">\n  <img src="a.png"/>\n'
+            "</div>\n<p>x > y</p>\n<input disabled/>\n"
+        )
+        normal, calls = self._stream(self._call_text(body=body))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "write_file")
+        self.assertEqual(json.loads(calls[0].parameters), {"content": body})
+        self.assertNotIn("div", normal)
+
+    def test_closer_split_at_every_offset(self):
+        text = self._call_text(body="hello world")
+        closer = f"</{DSML} invoke>"
+        start = text.index(closer)
+        for i in range(1, len(closer)):
+            with self.subTest(offset=i):
+                _, calls = self._stream(
+                    text, chunks=[text[: start + i], text[start + i :]]
+                )
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0].name, "write_file")
+                self.assertEqual(
+                    json.loads(calls[0].parameters), {"content": "hello world"}
+                )
+
+    def test_two_consecutive_invokes(self):
+        text = (
+            f"\n\n<{DSML} calls>\n"
+            f'<{DSML} invoke name="write_file">\n'
+            f'<{DSML} parameter name="content" string="true">one</{DSML} parameter>\n'
+            f"</{DSML} invoke>\n"
+            f'<{DSML} invoke name="lookup"/>\n'
+            f"</{DSML} calls>"
+        )
+        normal, calls = self._stream(text)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].name, "write_file")
+        self.assertEqual(json.loads(calls[0].parameters), {"content": "one"})
+        self.assertEqual(calls[1].name, "lookup")
+        self.assertEqual(calls[1].tool_index, 1)
+
+    def test_prose_around_call(self):
+        text = "let me write that.\n\n" + self._call_text(body="data")
+        normal, calls = self._stream(text)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("let me write that.", normal)
+        self.assertEqual(json.loads(calls[0].parameters), {"content": "data"})
+
+    def test_stray_angle_brackets_stream_as_prose(self):
+        text = "if a < b and c </ d then done"
+        detector = DeepSeekV41Detector()
+        deltas = ""
+        emitted_early = False
+        for c in text:
+            r = detector.parse_streaming_increment(c, self.tools)
+            if r.normal_text:
+                emitted_early = True
+            deltas += r.normal_text
+        deltas += detector.finish(self.tools).normal_text
+        self.assertTrue(emitted_early)
+        self.assertEqual(deltas, text)
+
+    def test_stray_angle_brackets_before_call(self):
+        text = "if a < b and c </ d then done\n\n" + self._call_text(body="x")
+        normal, calls = self._stream(text)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("if a < b and c </ d then done", normal)
+        self.assertEqual(json.loads(calls[0].parameters), {"content": "x"})
+
+
 if __name__ == "__main__":
     import unittest
 
