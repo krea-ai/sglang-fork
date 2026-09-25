@@ -258,10 +258,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     @staticmethod
-    def _invoke_header_kind(buf: str, i: int) -> str | None:
+    def _invoke_header_kind(buf: str, i: int) -> tuple[str, int] | None:
         """Classify the invoke header following the start token at ``buf[i]``
-        against invoke_regex's ``\\s+name="[^"]+"\\s*(/>|>)``: "self_close",
-        "open", "invalid", or None while it is still streaming in."""
+        against invoke_regex's ``\\s+name="[^"]+"\\s*(/>|>)``. Returns
+        ("self_close" | "open" | "invalid", end offset), or None while the
+        header is still streaming in."""
         n = len(buf)
         j = i
         while j < n and buf[j].isspace():
@@ -269,46 +270,38 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if j == n:
             return None
         if j == i:
-            return "invalid"
+            return "invalid", j
         for ch in 'name="':
             if j == n:
                 return None
             if buf[j] != ch:
-                return "invalid"
+                return "invalid", j
             j += 1
         name_start = j
         j = buf.find('"', j)
         if j == -1:
             return None
         if j == name_start:
-            return "invalid"
+            return "invalid", j
         j += 1
         while j < n and buf[j].isspace():
             j += 1
         if j == n:
             return None
         if buf[j] == ">":
-            return "open"
+            return "open", j + 1
         if buf[j] != "/":
-            return "invalid"
+            return "invalid", j
         if j + 1 == n:
             return None
-        return "self_close" if buf[j + 1] == ">" else "invalid"
+        if buf[j + 1] == ">":
+            return "self_close", j + 2
+        return "invalid", j
 
     def _invoke_terminated(self) -> bool:
-        """Whether the buffer holds an invoke terminator: a complete
-        ``</invoke>`` closer, or a self-closing ``/>`` header."""
+        """Whether invoke_regex would now match a complete invoke: the first
+        valid header is self-closing, or an ``</invoke>`` closer follows it."""
         buf = self._buffer
-        # Search only past _scan_pos, rewound by len(token)-1 so a closer
-        # split across chunks is not missed.
-        if (
-            buf.find(
-                self.invoke_end_token,
-                max(self._scan_pos - (len(self.invoke_end_token) - 1), 0),
-            )
-            != -1
-        ):
-            return True
         if not self._invoke_hdr_done:
             # invoke_regex matches the first *valid* header, skipping malformed
             # ones, so classify each invoke start in turn. Decided-invalid
@@ -319,18 +312,34 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 start = buf.find(token, pos)
                 if start == -1:
                     self._invoke_hdr_pos = max(pos, len(buf) - len(token) + 1)
-                    break
-                kind = self._invoke_header_kind(buf, start + len(token))
-                if kind is None:
+                    return False
+                header = self._invoke_header_kind(buf, start + len(token))
+                if header is None:
                     self._invoke_hdr_pos = start
-                    break
+                    return False
+                kind, end = header
                 if kind == "invalid":
                     pos = start + 1
                     continue
                 self._invoke_hdr_done = True
                 self._invoke_self_close = kind == "self_close"
+                # Closers before the header's end cannot close this invoke.
+                self._invoke_hdr_pos = end
                 break
-        return self._invoke_hdr_done and self._invoke_self_close
+        if self._invoke_self_close:
+            return True
+        # Search only past _scan_pos, rewound by len(token)-1 so a closer
+        # split across chunks is not missed.
+        return (
+            buf.find(
+                self.invoke_end_token,
+                max(
+                    self._scan_pos - (len(self.invoke_end_token) - 1),
+                    self._invoke_hdr_pos,
+                ),
+            )
+            != -1
+        )
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]

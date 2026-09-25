@@ -1,7 +1,9 @@
 import functools
 import json
+import re
 import unittest
 import warnings
+from unittest import mock
 
 import xgrammar as xgr
 
@@ -6178,6 +6180,41 @@ class TestDeepSeekV32BoundedScan(unittest.TestCase):
         )
         _, calls = self._stream(text)
         self.assertEqual([c.name for c in calls], ["write_file", "lookup"])
+
+    def _count_invoke_scans(self, text, chunk_size=4):
+        detector = DeepSeekV32Detector()
+        real_search = re.search
+        scans = 0
+
+        def counting_search(pattern, string, flags=0):
+            nonlocal scans
+            if pattern == detector.invoke_regex:
+                scans += 1
+            return real_search(pattern, string, flags)
+
+        calls = []
+        with mock.patch.object(re, "search", side_effect=counting_search):
+            for i in range(0, len(text), chunk_size):
+                result = detector.parse_streaming_increment(
+                    text[i : i + chunk_size], self.tools
+                )
+                calls.extend(result.calls)
+        return scans, calls
+
+    def test_invoke_regex_runs_once_per_completed_invoke(self):
+        body = '<div class="box"><img src="a.png"/></div>\n' * 1000
+        prefixes = {
+            "none": "",
+            "stray closer": f"</{self.D}invoke>",
+            "closed malformed invoke": f"<{self.D}invoke>junk</{self.D}invoke>",
+        }
+        for label, prefix in prefixes.items():
+            with self.subTest(prefix=label):
+                scans, calls = self._count_invoke_scans(
+                    prefix + self._call_text(body=body)
+                )
+                self.assertEqual([c.name for c in calls], ["write_file"])
+                self.assertLessEqual(scans, 2)
 
 
 if __name__ == "__main__":
