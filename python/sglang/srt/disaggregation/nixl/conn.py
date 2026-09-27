@@ -994,6 +994,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self.kv_args.kv_item_lens[seg.start : seg.end],
                     self.kv_args.kv_data_lens[seg.start : seg.end],
                     self.kv_args.gpu_id,
+                    num_slots=self._num_slots_src,
                     mem_kind=seg.src_mem_kind,
                 )
                 self.prep_handles_segment_src[src_key] = src_handle
@@ -1157,6 +1158,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     "",
                     self.kv_args.kv_data_ptrs,
                     self.kv_args.gpu_id,
+                    num_slots=self._num_slots_src,
                     mem_kind=src_mem_kind,
                 )
             dst_num_slots = (
