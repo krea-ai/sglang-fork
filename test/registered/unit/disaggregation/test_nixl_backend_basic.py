@@ -1405,6 +1405,61 @@ class DlistCaptureAgent:
         return f"handle_{len(self.calls)}"
 
 
+class TestNixlEqualTpUnevenSrcRegions(CustomTestCase):
+    """DeepSeek-V4 registers compressed buffers whose physical page counts
+    differ by one page (ratio-2 pools pad a full page). Transfer indices are
+    laid out as ``entry * _num_slots_src + page``, so every entry of the
+    shared source dlist must span exactly ``_num_slots_src`` descriptors."""
+
+    ITEM_LEN = 64
+    NUM_SLOTS = 4
+    SRC_PTRS = [0x10000, 0x20000, 0x30000]
+    SRC_SLOTS = [NUM_SLOTS, NUM_SLOTS + 1, NUM_SLOTS + 1]
+
+    def _make_manager(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = DlistCaptureAgent()
+        mgr.prep_handles = {}
+        mgr.is_mla_backend = True
+        mgr.is_hybrid_mla_backend = False
+        mgr.attn_tp_size = 1
+        mgr.pp_size = 1
+        mgr.src_mem_kind = "VRAM"
+        mgr._num_slots_src = self.NUM_SLOTS
+        mgr.kv_args = SimpleNamespace(
+            gpu_id=0,
+            kv_item_lens=[self.ITEM_LEN] * len(self.SRC_PTRS),
+            kv_data_ptrs=list(self.SRC_PTRS),
+            kv_data_lens=[n * self.ITEM_LEN for n in self.SRC_SLOTS],
+            kv_layer_ids=None,
+            mla_compression_ratios=[1, 2],
+        )
+        return mgr
+
+    def test_src_dlist_entries_use_uniform_slot_stride(self):
+        mgr = self._make_manager()
+        dst_num_slots = 8
+        peer_info = SimpleNamespace(
+            agent_name="decode_0",
+            gpu_id=0,
+            decode_tp_size=1,
+            requires_dcp_relayout=False,
+            dst_kv_ptrs=[0x40000, 0x50000, 0x60000],
+            dst_kv_item_lens=[self.ITEM_LEN] * 3,
+            dst_kv_mem_kinds=["VRAM"] * 3,
+            dst_kv_layer_ids=None,
+            dst_num_slots=dst_num_slots,
+        )
+        mgr._prepare_payload_xfer(peer_info)
+
+        src_array = next(c[1] for c in mgr.agent.calls if c[0] == "")
+        self.assertEqual(len(src_array), self.NUM_SLOTS * len(self.SRC_PTRS))
+        for entry, ptr in enumerate(self.SRC_PTRS):
+            for page in range(self.NUM_SLOTS):
+                addr = int(src_array[entry * self.NUM_SLOTS + page][0])
+                self.assertEqual(addr, ptr + page * self.ITEM_LEN)
+
+
 class TestNixlHeteroTpReplicatedKV(CustomTestCase):
     """Regression guard for #31295.
 
